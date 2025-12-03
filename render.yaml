@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vpn-relay
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: TARGET_HOST
+        value: 77.221.156.175
+      - key: TARGET_PORT
+        value: 8080
+      - key: TARGET_PATH
+        value: /ws
