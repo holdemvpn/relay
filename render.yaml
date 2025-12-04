@@ -1,13 +1,18 @@
+# This file is for manual deployment reference only
+# When deploying via HoldemVPN bot, environment variables are set automatically
 services:
   - type: web
     name: vpn-relay
     runtime: node
+    plan: free
+    region: frankfurt
     buildCommand: npm install
-    startCommand: npm start
+    startCommand: node index.js
+    healthCheckPath: /health
     envVars:
       - key: TARGET_HOST
-        value: 77.221.156.175
+        value: YOUR_VPN_SERVER_IP
       - key: TARGET_PORT
         value: 8080
       - key: TARGET_PATH
-        value: /ws
+        value: /vless
