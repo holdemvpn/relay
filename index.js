@@ -1,106 +1,143 @@
 const http = require('http');
-const { WebSocket, WebSocketServer } = require('ws');
+const net = require('net');
 
 const TARGET_HOST = process.env.TARGET_HOST || '77.221.156.175';
 const TARGET_PORT = process.env.TARGET_PORT || '8080';
-const TARGET_PATH = process.env.TARGET_PATH || '/vless-ws';
+const TARGET_PATH = process.env.TARGET_PATH || '/vless';
 const PANEL_PORT = process.env.PANEL_PORT || '9876';
 const PORT = process.env.PORT || 10000;
 
 const server = http.createServer((req, res) => {
   console.log(`HTTP: ${req.method} ${req.url}`);
   
+  // Проксируем на панель 3x-ui
   const options = {
     hostname: TARGET_HOST,
     port: PANEL_PORT,
     path: req.url,
     method: req.method,
-    headers: {
-      ...req.headers,
-      host: `${TARGET_HOST}:${PANEL_PORT}`
-    }
+    headers: { ...req.headers, host: `${TARGET_HOST}:${PANEL_PORT}` }
   };
 
   const proxyReq = http.request(options, (proxyRes) => {
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
   });
-
   proxyReq.on('error', (err) => {
-    console.error('Panel proxy error:', err.message);
     res.writeHead(502);
-    res.end('Panel Proxy Error: ' + err.message);
+    res.end('Error: ' + err.message);
   });
-
   req.pipe(proxyReq);
 });
 
-// WebSocket relay для VPN
-const wss = new WebSocketServer({ server, path: '/vless-ws' });
-
-wss.on('connection', (clientWs, req) => {
-  console.log('=== NEW VPN CONNECTION ===');
-  console.log('Client IP:', req.socket.remoteAddress);
+// Обрабатываем WebSocket/HTTPUpgrade на /vless
+server.on('upgrade', (req, clientSocket, head) => {
+  console.log('=== UPGRADE REQUEST ===');
+  console.log('Path:', req.url);
   console.log('Headers:', JSON.stringify(req.headers, null, 2));
   
-  const targetUrl = `ws://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}`;
-  console.log('Connecting to:', targetUrl);
+  if (req.url !== '/vless') {
+    clientSocket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    clientSocket.destroy();
+    return;
+  }
   
-  const targetWs = new WebSocket(targetUrl, {
-    perMessageDeflate: false,
-    headers: {
-      'Host': `${TARGET_HOST}:${TARGET_PORT}`
-    }
+  // Подключаемся к VPN серверу
+  const targetSocket = net.connect(TARGET_PORT, TARGET_HOST, () => {
+    console.log('Connected to VPN server');
+    
+    // Отправляем HTTPUpgrade запрос на целевой сервер
+    const upgradeRequest = 
+      `GET ${TARGET_PATH} HTTP/1.1\r\n` +
+      `Host: ${TARGET_HOST}:${TARGET_PORT}\r\n` +
+      `Upgrade: websocket\r\n` +
+      `Connection: Upgrade\r\n` +
+      `Sec-WebSocket-Key: ${req.headers['sec-websocket-key'] || 'dGVzdA=='}\r\n` +
+      `Sec-WebSocket-Version: 13\r\n` +
+      `\r\n`;
+    
+    targetSocket.write(upgradeRequest);
+    
+    // Ждём ответ от сервера
+    let responseReceived = false;
+    let buffer = Buffer.alloc(0);
+    
+    targetSocket.once('data', (data) => {
+      buffer = Buffer.concat([buffer, data]);
+      const response = buffer.toString();
+      
+      if (response.includes('101')) {
+        console.log('VPN server accepted upgrade');
+        
+        // Отправляем успешный ответ клиенту
+        clientSocket.write('HTTP/1.1 101 Switching Protocols\r\n' +
+          'Upgrade: websocket\r\n' +
+          'Connection: Upgrade\r\n' +
+          'Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n' +
+          '\r\n');
+        
+        // Если есть данные после заголовков, передаём их
+        const headerEnd = buffer.indexOf('\r\n\r\n');
+        if (headerEnd !== -1 && buffer.length > headerEnd + 4) {
+          const remaining = buffer.slice(headerEnd + 4);
+          if (remaining.length > 0) {
+            clientSocket.write(remaining);
+          }
+        }
+        
+        // Если был head от клиента, отправляем на сервер
+        if (head && head.length > 0) {
+          targetSocket.write(head);
+        }
+        
+        // Пайпим в обе стороны
+        let bytesUp = 0, bytesDown = 0;
+        
+        clientSocket.on('data', (d) => {
+          bytesUp += d.length;
+          targetSocket.write(d);
+        });
+        
+        targetSocket.on('data', (d) => {
+          bytesDown += d.length;
+          clientSocket.write(d);
+        });
+        
+        clientSocket.on('close', () => {
+          console.log(`Client closed. Up: ${bytesUp}, Down: ${bytesDown}`);
+          targetSocket.destroy();
+        });
+        
+        targetSocket.on('close', () => {
+          console.log('VPN closed');
+          clientSocket.destroy();
+        });
+        
+        responseReceived = true;
+      } else {
+        console.log('VPN rejected:', response.slice(0, 100));
+        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        clientSocket.destroy();
+        targetSocket.destroy();
+      }
+    });
   });
   
-  let bytesFromClient = 0;
-  let bytesToClient = 0;
-  
-  targetWs.on('open', () => {
-    console.log('✓ Connected to VPN server');
+  targetSocket.on('error', (err) => {
+    console.error('Target error:', err.message);
+    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+    clientSocket.destroy();
   });
   
-  targetWs.on('message', (data, isBinary) => {
-    bytesToClient += data.length;
-    console.log(`VPN→Client: ${data.length} bytes (total: ${bytesToClient})`);
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(data, { binary: isBinary });
-    }
-  });
-  
-  clientWs.on('message', (data, isBinary) => {
-    bytesFromClient += data.length;
-    console.log(`Client→VPN: ${data.length} bytes (total: ${bytesFromClient})`);
-    if (targetWs.readyState === WebSocket.OPEN) {
-      targetWs.send(data, { binary: isBinary });
-    }
-  });
-  
-  targetWs.on('close', (code, reason) => {
-    console.log(`VPN closed: ${code} ${reason.toString()}`);
-    clientWs.close();
-  });
-  
-  clientWs.on('close', (code, reason) => {
-    console.log(`Client closed: ${code}`);
-    console.log(`Stats: Client→VPN: ${bytesFromClient}, VPN→Client: ${bytesToClient}`);
-    targetWs.close();
-  });
-  
-  targetWs.on('error', (err) => {
-    console.error('VPN error:', err.message);
-    clientWs.close();
-  });
-  
-  clientWs.on('error', (err) => {
+  clientSocket.on('error', (err) => {
     console.error('Client error:', err.message);
-    targetWs.close();
+    targetSocket.destroy();
   });
 });
 
 server.listen(PORT, () => {
   console.log(`=== VPN Relay Started ===`);
   console.log(`Port: ${PORT}`);
-  console.log(`VPN: ws://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}`);
-  console.log(`Panel: http://${TARGET_HOST}:${PANEL_PORT}`);
+  console.log(`VPN: ${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}`);
+  console.log(`Panel: ${TARGET_HOST}:${PANEL_PORT}`);
 });
