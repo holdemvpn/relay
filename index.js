@@ -8,7 +8,8 @@ const PANEL_PORT = process.env.PANEL_PORT || '9876';
 const PORT = process.env.PORT || 10000;
 
 const server = http.createServer((req, res) => {
-  // Проксируем HTTP запросы на 3x-ui панель
+  console.log(`HTTP: ${req.method} ${req.url}`);
+  
   const options = {
     hostname: TARGET_HOST,
     port: PANEL_PORT,
@@ -34,40 +35,55 @@ const server = http.createServer((req, res) => {
   req.pipe(proxyReq);
 });
 
-// WebSocket для VPN на /vless-ws
+// WebSocket relay для VPN
 const wss = new WebSocketServer({ server, path: '/vless-ws' });
 
 wss.on('connection', (clientWs, req) => {
-  console.log('VPN Client connected from:', req.socket.remoteAddress);
+  console.log('=== NEW VPN CONNECTION ===');
+  console.log('Client IP:', req.socket.remoteAddress);
+  console.log('Headers:', JSON.stringify(req.headers, null, 2));
   
   const targetUrl = `ws://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}`;
-  console.log('Connecting to VPN:', targetUrl);
+  console.log('Connecting to:', targetUrl);
   
-  const targetWs = new WebSocket(targetUrl);
-  
-  targetWs.on('open', () => {
-    console.log('Connected to VPN server');
-  });
-  
-  targetWs.on('message', (data) => {
-    if (clientWs.readyState === WebSocket.OPEN) {
-      clientWs.send(data);
+  const targetWs = new WebSocket(targetUrl, {
+    perMessageDeflate: false,
+    headers: {
+      'Host': `${TARGET_HOST}:${TARGET_PORT}`
     }
   });
   
-  clientWs.on('message', (data) => {
+  let bytesFromClient = 0;
+  let bytesToClient = 0;
+  
+  targetWs.on('open', () => {
+    console.log('✓ Connected to VPN server');
+  });
+  
+  targetWs.on('message', (data, isBinary) => {
+    bytesToClient += data.length;
+    console.log(`VPN→Client: ${data.length} bytes (total: ${bytesToClient})`);
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(data, { binary: isBinary });
+    }
+  });
+  
+  clientWs.on('message', (data, isBinary) => {
+    bytesFromClient += data.length;
+    console.log(`Client→VPN: ${data.length} bytes (total: ${bytesFromClient})`);
     if (targetWs.readyState === WebSocket.OPEN) {
-      targetWs.send(data);
+      targetWs.send(data, { binary: isBinary });
     }
   });
   
   targetWs.on('close', (code, reason) => {
-    console.log('VPN connection closed:', code, reason.toString());
+    console.log(`VPN closed: ${code} ${reason.toString()}`);
     clientWs.close();
   });
   
   clientWs.on('close', (code, reason) => {
-    console.log('Client disconnected:', code);
+    console.log(`Client closed: ${code}`);
+    console.log(`Stats: Client→VPN: ${bytesFromClient}, VPN→Client: ${bytesToClient}`);
     targetWs.close();
   });
   
@@ -83,7 +99,8 @@ wss.on('connection', (clientWs, req) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`Relay running on port ${PORT}`);
-  console.log(`VPN WebSocket path: /vless-ws -> ws://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}`);
-  console.log(`Panel proxy: / -> http://${TARGET_HOST}:${PANEL_PORT}`);
+  console.log(`=== VPN Relay Started ===`);
+  console.log(`Port: ${PORT}`);
+  console.log(`VPN: ws://${TARGET_HOST}:${TARGET_PORT}${TARGET_PATH}`);
+  console.log(`Panel: http://${TARGET_HOST}:${PANEL_PORT}`);
 });
