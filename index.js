@@ -3,7 +3,7 @@ const { WebSocket, WebSocketServer } = require('ws');
 
 const TARGET_HOST = process.env.TARGET_HOST || '77.221.156.175';
 const TARGET_PORT = process.env.TARGET_PORT || '8080';
-const TARGET_PATH = '/vless-ws';
+const TARGET_PATH = '/vless';
 const PANEL_PORT = process.env.PANEL_PORT || '9876';
 const PORT = process.env.PORT || 10000;
 
@@ -82,7 +82,7 @@ wss.on('connection', (clientWs, req) => {
 server.on('upgrade', (req, socket, head) => {
   console.log(`[UPGRADE] ${req.url}`);
   
-  if (req.url === '/vless-ws' || req.url.startsWith('/vless-ws?')) {
+  if (req.url === '/vless' || req.url.startsWith('/vless-ws?')) {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
     });
